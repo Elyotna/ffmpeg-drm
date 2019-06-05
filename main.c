@@ -81,6 +81,7 @@ struct drm_dev {
 static struct drm_dev *pdev;
 static unsigned int drm_format;
 static int disable_plane_id = 0;
+static unsigned disable_plane_id_done;
 
 #define DBG_TAG "  ffmpeg-drm"
 
@@ -204,7 +205,7 @@ int drm_get_plane_props(int fd, uint32_t id)
 	return 0;
 }
 
-int drm_add_property(const char *name, uint64_t value)
+int drm_add_property(unsigned int id, const char *name, uint64_t value)
 {
 	int ret;
 	uint32_t prop_id = get_property_id(name);
@@ -214,13 +215,53 @@ int drm_add_property(const char *name, uint64_t value)
 		return -1;
 	}
 
-	ret = drmModeAtomicAddProperty(pdev->req, pdev->plane_id, get_property_id(name), value);
+	ret = drmModeAtomicAddProperty(pdev->req, id, prop_id, value);
 	if (ret < 0) {
 		err("drmModeAtomicAddProperty (%s:%lu) failed: %d\n", name, value, ret);
 		return ret;
 	}
 
 	return 0;
+}
+
+static int disable_other_planes(int fd, unsigned int video_plane)
+{
+	drmModePlaneResPtr planes;
+	drmModePlanePtr plane;
+	unsigned int i;
+	int ret = 0;
+
+	planes = drmModeGetPlaneResources(fd);
+	if (!planes) {
+		err("drmModeGetPlaneResources failed\n");
+		return -1;
+	}
+
+	for (i = 0; i < planes->count_planes; ++i) {
+		plane = drmModeGetPlane(fd, planes->planes[i]);
+		if (!plane) {
+			err("drmModeGetPlane failed: %s\n", strerror(errno));
+			break;
+		}
+
+		if (!(plane->possible_crtcs & (1 << pdev->crtc_idx)) ||
+		    plane->plane_id == video_plane) {
+			drmModeFreePlane(plane);
+			continue;
+		}
+
+		ret = drm_add_property(plane->plane_id, "FB_ID", 0);
+		ret |= drm_add_property(plane->plane_id, "CRTC_ID", 0);
+
+		drmModeFreePlane(plane);
+
+		if (ret)
+			break;
+	}
+
+	drmModeFreePlaneResources(planes);
+
+	return ret;
 }
 
 int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
@@ -260,21 +301,25 @@ int drm_dmabuf_set_plane(struct drm_buffer *buf, uint32_t width,
 
 	printf("crtc_x: %u; crtc_y:%u; crtc_w: %u; crtc_h: %u\n", crtc_x, crtc_y, crtc_w, crtc_h);
 
-	drm_add_property("FB_ID", buf->fb_handle);
-	drm_add_property("CRTC_ID", pdev->crtc_id);
-	drm_add_property("SRC_X", 0);
-	drm_add_property("SRC_Y", 0);
-	drm_add_property("SRC_W", width << 16);
-	drm_add_property("SRC_H", height << 16);
-	drm_add_property("CRTC_X", crtc_x);
-	drm_add_property("CRTC_Y", crtc_y);
-	drm_add_property("CRTC_W", crtc_w);
-	drm_add_property("CRTC_H", crtc_h);
+	drm_add_property(pdev->plane_id, "FB_ID", buf->fb_handle);
+	drm_add_property(pdev->plane_id, "CRTC_ID", pdev->crtc_id);
+	drm_add_property(pdev->plane_id, "SRC_X", 0);
+	drm_add_property(pdev->plane_id, "SRC_Y", 0);
+	drm_add_property(pdev->plane_id, "SRC_W", width << 16);
+	drm_add_property(pdev->plane_id, "SRC_H", height << 16);
+	drm_add_property(pdev->plane_id, "CRTC_X", crtc_x);
+	drm_add_property(pdev->plane_id, "CRTC_Y", crtc_y);
+	drm_add_property(pdev->plane_id, "CRTC_W", crtc_w);
+	drm_add_property(pdev->plane_id, "CRTC_H", crtc_h);
 
 	if (disable_plane_id) {
-		set_plane_transparent(disable_plane_id);
-		disable_plane_id = 0;
+		if (!disable_plane_id_done) {
+			set_plane_transparent(disable_plane_id);
+			disable_plane_id_done = 1;
+		}
 	}
+	else
+		disable_other_planes(pdev->fd, pdev->plane_id);
 
 	ret = drmModeAtomicCommit(pdev->fd, pdev->req, DRM_MODE_PAGE_FLIP_EVENT  | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
 	if (ret) {
